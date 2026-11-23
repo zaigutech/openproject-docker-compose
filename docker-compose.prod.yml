@@ -1,0 +1,30 @@
+# 生产环境专用配置。
+#
+# 生产：`docker compose -f docker-compose.yml -f docker-compose.prod.yml up -d`。
+# 显式指定 -f 时 Compose 不会加载开发专用的 docker-compose.override.yml，所以不对宿主机暴露端口，由公用 Caddy 反代到
+# openproject-web:8080 和 hocuspocus:1234。密钥来自服务器的 .env，没配置就直接报错。
+x-prod-env: &prod-env
+  OPENPROJECT_HTTPS: "true"
+  OPENPROJECT_HOST__NAME: op.zaigu.com
+  OPENPROJECT_COLLABORATIVE__EDITING__HOCUSPOCUS__URL: wss://op.zaigu.com/hocuspocus
+  OPENPROJECT_COLLABORATIVE__EDITING__HOCUSPOCUS__SECRET: "${COLLABORATIVE_SERVER_SECRET:?set COLLABORATIVE_SERVER_SECRET in .env}"
+  SECRET_KEY_BASE: "${SECRET_KEY_BASE:?set SECRET_KEY_BASE in .env}"
+
+services:
+  openproject-web:
+    hostname: op.zaigu.com
+    environment: *prod-env
+
+  openproject-worker:
+    environment: *prod-env
+
+  openproject-cron:
+    environment: *prod-env
+
+  openproject-seeder:
+    environment: *prod-env
+
+  hocuspocus:
+    environment:
+      SECRET: "${COLLABORATIVE_SERVER_SECRET:?set COLLABORATIVE_SERVER_SECRET in .env}"
+      OPENPROJECT_HTTPS: "true"

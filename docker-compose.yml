@@ -1,28 +1,46 @@
+# 这里只放开发和生产共用的配置。开发见 docker-compose.override.yml，生产见 docker-compose.prod.yml。
+# 需要先启动 ../middleware，它提供 zaigu_network、db 和数据库密码。
+#
+# Compose 把服务名注册成共享网络上的别名，所以服务名带 openproject- 前缀：web 会和 Plane 的 web 冲突。
+# hocuspocus 不加前缀：上游经常升级紧挨着服务名的 image 行，改名每次合并都会冲突，这个名字目前也没有冲突。
 networks:
-  frontend:
-  backend:
+  default:
+    external: true
+    name: zaigu_network
+
+secrets:
+  openproject_password:
+    file: ../middleware/secrets/openproject_password
 
 volumes:
-  pgdata:
   opdata:
 
 x-op-restart-policy: &restart_policy
   restart: unless-stopped
 x-op-image: &image
-  image: openproject/openproject:${TAG:-17-slim}
+  image: openproject/openproject:${TAG:-18-rc-slim}
 x-op-app: &app
   <<: [*image, *restart_policy]
+  secrets:
+    - openproject_password
+  # 从 secret 拼出 DATABASE_URL，再交给镜像原来的 entrypoint
+  entrypoint:
+    - /bin/bash
+    - -c
+    - |
+      export DATABASE_URL="postgres://openproject:$$(cat /run/secrets/openproject_password)@db/openproject_db?pool=20&encoding=unicode&reconnect=true"
+      exec ./docker/prod/entrypoint-slim.sh "$$@"
+    - "--"
   environment:
     OPENPROJECT_HTTPS: "${OPENPROJECT_HTTPS:-true}"
     OPENPROJECT_HOST__NAME: "${OPENPROJECT_HOST__NAME:-localhost:8080}"
-    OPENPROJECT_ADDITIONAL__HOST__NAMES: "${OPENPROJECT_ADDITIONAL__HOST__NAMES:-web}" # to allow access from hocuspocus directly
+    OPENPROJECT_ADDITIONAL__HOST__NAMES: "${OPENPROJECT_ADDITIONAL__HOST__NAMES:-openproject-web}" # to allow access from hocuspocus directly
     OPENPROJECT_HSTS: "${OPENPROJECT_HSTS:-true}"
     OPENPROJECT_RAILS__CACHE__STORE: "memcache"
-    OPENPROJECT_CACHE__MEMCACHE__SERVER: "cache:11211"
+    OPENPROJECT_CACHE__MEMCACHE__SERVER: "openproject-cache:11211"
     OPENPROJECT_RAILS__RELATIVE__URL__ROOT: "${OPENPROJECT_RAILS__RELATIVE__URL__ROOT:-}"
-    OPENPROJECT_COLLABORATIVE__EDITING__HOCUSPOCUS__URL: "${COLLABORATIVE_SERVER_URL:-wss://${OPENPROJECT_HOST__NAME}/hocuspocus}"
+    OPENPROJECT_COLLABORATIVE__EDITING__HOCUSPOCUS__URL: "${COLLABORATIVE_SERVER_URL:-wss://${OPENPROJECT_HOST__NAME:-localhost:8080}/hocuspocus}"
     OPENPROJECT_COLLABORATIVE__EDITING__HOCUSPOCUS__SECRET: "${COLLABORATIVE_SERVER_SECRET:-OVERRIDE_ME_PLEASE}"
-    DATABASE_URL: "${DATABASE_URL:-postgres://postgres:p4ssw0rd@db/openproject?pool=20&encoding=unicode&reconnect=true}"
     RAILS_MIN_THREADS: ${RAILS_MIN_THREADS:-4}
     RAILS_MAX_THREADS: ${RAILS_MAX_THREADS:-16}
     # set to true to enable the email receiving feature. See ./docker/cron for more options
@@ -32,55 +50,20 @@ x-op-app: &app
     - "${OPDATA:-opdata}:/var/openproject/assets"
 
 services:
-  db:
-    # The default here should really be 17 but is still 13 as to not break existing setups.
-    # New installations using the provided .env.example will use 17 to begin with.
-    # The default here will change to 17 as well with the next major update (18).
-    #
-    # Refer to the docs on how to upgrade to postgres 17 before then:
-    #   https://www.openproject.org/docs/installation-and-operations/misc/migration-to-postgresql17/
-    image: postgres:${POSTGRES_VERSION:-13}
-    <<: *restart_policy
-    stop_grace_period: "3s"
-    volumes:
-      - "${PGDATA:-pgdata}:/var/lib/postgresql/data"
-    environment:
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-p4ssw0rd}
-      POSTGRES_DB: openproject
-    networks:
-      - backend
-
-  cache:
+  openproject-cache:
     image: memcached
     <<: *restart_policy
-    networks:
-      - backend
 
-  proxy:
-    build:
-      context: ./proxy
-      args:
-        APP_HOST: web
-    image: openproject/proxy
-    <<: *restart_policy
-    ports:
-      - "${PORT:-8080}:80"
-    depends_on:
-      - web
-    networks:
-      - frontend
-
-  web:
+  openproject-web:
     <<: *app
     command: "./docker/prod/web"
     hostname: "${OPENPROJECT_HOST__NAME:-localhost:8080}"
-    networks:
-      - frontend
-      - backend
     depends_on:
-      - db
-      - cache
-      - seeder
+      openproject-cache:
+        condition: service_started
+      # 等迁移完成再启动，否则它们启动时会和 seeder 抢着建表，导致首次初始化失败
+      openproject-seeder:
+        condition: service_completed_successfully
     labels:
       - autoheal=true
     healthcheck:
@@ -99,40 +82,35 @@ services:
       AUTOHEAL_START_PERIOD: 600
       AUTOHEAL_INTERVAL: 30
 
-  worker:
+  openproject-worker:
     <<: *app
     command: "./docker/prod/worker"
-    networks:
-      - backend
     depends_on:
-      - db
-      - cache
-      - seeder
+      openproject-cache:
+        condition: service_started
+      # 等迁移完成再启动，否则它们启动时会和 seeder 抢着建表，导致首次初始化失败
+      openproject-seeder:
+        condition: service_completed_successfully
 
-  cron:
+  openproject-cron:
     <<: *app
     command: "./docker/prod/cron"
-    networks:
-      - backend
     depends_on:
-      - db
-      - cache
-      - seeder
+      openproject-cache:
+        condition: service_started
+      # 等迁移完成再启动，否则它们启动时会和 seeder 抢着建表，导致首次初始化失败
+      openproject-seeder:
+        condition: service_completed_successfully
 
-  seeder:
+  openproject-seeder:
     <<: *app
     command: "./docker/prod/seeder"
     restart: on-failure
-    networks:
-      - backend
 
   hocuspocus:
-    image: openproject/hocuspocus:17.9.7
+    image: openproject/hocuspocus:${HOCUSPOCUS_TAG:-18.0-rc}
     environment:
       SECRET: ${COLLABORATIVE_SERVER_SECRET:-OVERRIDE_ME_PLEASE}
-      OPENPROJECT_URL: "${OPENPROJECT_URL:-http://web:8080}"
+      OPENPROJECT_URL: "${OPENPROJECT_URL:-http://openproject-web:8080}"
       OPENPROJECT_HTTPS: "${OPENPROJECT_HTTPS:-true}"
-    networks:
-      - backend
-      - frontend
     <<: *restart_policy
